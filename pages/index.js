@@ -1,4 +1,4 @@
-// pages/index.js — v4 (batched signal loading, 2 coins per batch)
+// pages/index.js — v5 (reads from Supabase cache, instant load)
 import { useState, useEffect, useRef } from 'react'
 import Head from 'next/head'
 
@@ -7,12 +7,8 @@ const SIGNAL_CONFIG = {
   TRENDING_UP:   { label: 'Trending Up',           color: '#00e5a0', bg: 'rgba(0,229,160,0.10)', border: 'rgba(0,229,160,0.35)' },
   TRENDING_DOWN: { label: 'Trending Down',          color: '#888',    bg: 'rgba(120,120,120,0.1)', border: 'rgba(120,120,120,0.3)' },
   NEUTRAL:       { label: 'Neutral',               color: '#556',    bg: 'rgba(100,100,100,0.08)', border: 'rgba(100,100,100,0.2)' },
-  ERROR:         { label: 'Error',                 color: '#444',    bg: 'rgba(80,80,80,0.08)', border: 'rgba(80,80,80,0.2)' },
+  ERROR:         { label: 'Error',                 color: '#333',    bg: 'transparent', border: 'transparent' },
 }
-
-const BATCH_SIZE = 2        // coins per batch
-const BATCH_DELAY = 15000   // 15s between batches (CoinGecko free = 5 calls/min)
-const CALL_DELAY  = 3000    // 3s between coins within a batch
 
 function formatPrice(p) {
   if (p == null) return '—'
@@ -20,6 +16,14 @@ function formatPrice(p) {
   if (p < 1)     return `$${p.toFixed(4)}`
   if (p < 100)   return `$${p.toFixed(4)}`
   return `$${p.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+}
+
+function timeAgo(iso) {
+  if (!iso) return ''
+  const secs = Math.round((Date.now() - new Date(iso)) / 1000)
+  if (secs < 60) return `${secs}s ago`
+  if (secs < 3600) return `${Math.floor(secs/60)}m ago`
+  return `${Math.floor(secs/3600)}h ago`
 }
 
 function CandleBlock({ bullish }) {
@@ -36,16 +40,11 @@ function SignalBadge({ signal }) {
   )
 }
 
-function AssetRow({ asset, signals, index }) {
-  const tfs  = signals?.timeframes ?? null
-  const best = tfs?.reduce((b, tf) => tf.strength > (b?.strength ?? -1) ? tf : b, null)
+function AssetRow({ asset }) {
+  const tfs  = asset.timeframes ?? []
+  const best = tfs.reduce((b, tf) => tf.strength > (b?.strength ?? -1) ? tf : b, null)
   const pct  = asset.priceChangePercent
   const pctColor = pct > 0 ? '#00e5a0' : pct < 0 ? '#ff4444' : '#666'
-
-  // Which batch this coin belongs to (for the waiting label)
-  const batchNum   = Math.floor(index / BATCH_SIZE) + 1
-  const totalBatch = Math.ceil(10 / BATCH_SIZE)
-  const waitSecs   = Math.floor(index / BATCH_SIZE) * (BATCH_DELAY / 1000)
 
   return (
     <div style={{ borderBottom:'1px solid rgba(255,255,255,0.06)', padding:'16px 0' }}>
@@ -55,12 +54,7 @@ function AssetRow({ asset, signals, index }) {
           <span style={{ fontSize:13, color:'#445' }}>— {asset.name}</span>
         </div>
         <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-          {tfs
-            ? best ? <SignalBadge signal={best.signal} /> : <SignalBadge signal="NEUTRAL" />
-            : <span style={{ fontSize:11, color:'#334', fontFamily:"'Space Mono',monospace" }}>
-                {batchNum === 1 ? 'scanning…' : `batch ${batchNum}/${totalBatch} (~${waitSecs}s)`}
-              </span>
-          }
+          {best && best.signal !== 'ERROR' && <SignalBadge signal={best.signal} />}
           <div style={{ textAlign:'right' }}>
             <div style={{ fontSize:16, fontWeight:700, color:'#e8e8e0' }}>{formatPrice(asset.price)}</div>
             {pct != null && (
@@ -69,121 +63,52 @@ function AssetRow({ asset, signals, index }) {
           </div>
         </div>
       </div>
-
-      {tfs
-        ? tfs.map((tf) => (
-          <div key={tf.timeframe} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6, paddingLeft:4 }}>
-            <span style={{ fontSize:10, color:'#445', width:28, fontWeight:600, letterSpacing:'0.05em' }}>{tf.timeframe}</span>
-            <div style={{ display:'flex', gap:2 }}>
-              {tf.blocks?.map((b, i) => <CandleBlock key={i} bullish={b.bullish} />)}
-            </div>
-            <span style={{ fontSize:11, color: SIGNAL_CONFIG[tf.signal]?.color ?? '#555' }}>
-              {SIGNAL_CONFIG[tf.signal]?.label ?? tf.signal}
-            </span>
+      {tfs.map(tf => (
+        <div key={tf.timeframe} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6, paddingLeft:4 }}>
+          <span style={{ fontSize:10, color:'#445', width:28, fontWeight:600, letterSpacing:'0.05em' }}>{tf.timeframe}</span>
+          <div style={{ display:'flex', gap:2 }}>
+            {tf.blocks?.map((b, i) => <CandleBlock key={i} bullish={b.bullish} />)}
           </div>
-        ))
-        : ['1D','1W'].map((tf) => (
-          <div key={tf} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6, paddingLeft:4 }}>
-            <span style={{ fontSize:10, color:'#334', width:28, fontWeight:600 }}>{tf}</span>
-            <span style={{ fontSize:11, color:'#334' }}>
-              {batchNum === 1 ? 'fetching…' : `waiting for batch ${batchNum}…`}
-            </span>
-          </div>
-        ))
-      }
+          <span style={{ fontSize:11, color: SIGNAL_CONFIG[tf.signal]?.color ?? '#555' }}>
+            {SIGNAL_CONFIG[tf.signal]?.label ?? tf.signal}
+          </span>
+        </div>
+      ))}
     </div>
-  )
-}
-
-function Countdown({ target }) {
-  const [secs, setSecs] = useState(0)
-  useEffect(() => {
-    const tick = () => {
-      const left = Math.max(0, Math.round((target - Date.now()) / 1000))
-      setSecs(left)
-    }
-    tick()
-    const id = setInterval(tick, 1000)
-    return () => clearInterval(id)
-  }, [target])
-  if (secs <= 0) return null
-  return (
-    <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:'#f0b42988' }}>
-      next batch in {secs}s
-    </span>
   )
 }
 
 export default function Home() {
   const [assets,   setAssets]   = useState([])
-  const [signals,  setSignals]  = useState({})
   const [loading,  setLoading]  = useState(false)
-  const [progress, setProgress] = useState(0)
-  const [loaded,   setLoaded]   = useState(0)
-  const [lastScan, setLastScan] = useState(null)
-  const [nextBatch, setNextBatch] = useState(null)
-  const scanning = useRef(false)
+  const [seeding,  setSeeding]  = useState(false)
+  const [updatedAt, setUpdatedAt] = useState(null)
+  const [error,    setError]    = useState(null)
 
-  async function scan() {
-    if (scanning.current) return
-    scanning.current = true
+  async function load() {
     setLoading(true)
-    setSignals({})
-    setLoaded(0)
-    setProgress(5)
-    setNextBatch(null)
-
+    setError(null)
     try {
-      // Step 1: Load all prices instantly (1 API call)
       const r = await fetch('/api/scan')
       const data = await r.json()
-      const list = data.assets || []
-      setAssets(list)
-      setLastScan(new Date())
-      setProgress(10)
-
-      // Step 2: Split into batches and load with delays
-      const total = list.length
-      for (let b = 0; b < total; b += BATCH_SIZE) {
-        const batch = list.slice(b, b + BATCH_SIZE)
-
-        // Show countdown for the next batch (skip for first batch)
-        if (b > 0) {
-          const batchReady = Date.now() + BATCH_DELAY
-          setNextBatch(batchReady)
-          await new Promise(r => setTimeout(r, BATCH_DELAY))
-          setNextBatch(null)
-        }
-
-        // Fetch each coin in the batch with a small gap between them
-        for (let i = 0; i < batch.length; i++) {
-          if (i > 0) await new Promise(r => setTimeout(r, CALL_DELAY))
-          const coin = batch[i]
-          try {
-            const sr = await fetch(`/api/signals?id=${coin.id}`)
-            const sd = await sr.json()
-            setSignals(prev => ({ ...prev, [coin.id]: sd }))
-            setLoaded(prev => prev + 1)
-            setProgress(10 + Math.round(((b + i + 1) / total) * 90))
-          } catch (e) {
-            console.error('signal error', coin.id, e)
-          }
-        }
+      if (data.seeding) {
+        setSeeding(true)
+        setAssets([])
+      } else {
+        setSeeding(false)
+        setAssets(data.assets || [])
+        setUpdatedAt(data.scannedAt)
       }
     } catch(e) {
-      console.error(e)
+      setError(e.message)
     } finally {
       setLoading(false)
-      scanning.current = false
-      setProgress(100)
-      setTimeout(() => setProgress(0), 1000)
     }
   }
 
-  useEffect(() => { scan() }, [])
+  useEffect(() => { load() }, [])
 
-  const now   = lastScan?.toLocaleTimeString('en-SG', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }) ?? '—'
-  const total = assets.length || 10
+  const total = assets.length
 
   return (
     <>
@@ -203,28 +128,21 @@ export default function Home() {
               <div style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:'#446', letterSpacing:'0.25em', marginTop:1 }}>HEIKIN-ASHI SIGNAL SCANNER</div>
             </div>
             <div style={{ display:'flex', alignItems:'center', gap:16 }}>
-              {nextBatch && <Countdown target={nextBatch} />}
-              {lastScan && !nextBatch && (
+              {updatedAt && (
                 <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:'#445' }}>
-                  {loaded}/{total} Last: {now}
+                  {total}/{total} · updated {timeAgo(updatedAt)}
                 </span>
               )}
-              <button
-                onClick={() => { scanning.current = false; scan() }}
-                disabled={loading}
-                style={{ display:'flex', alignItems:'center', gap:7, background: loading ? '#8a6a1a' : '#f0b429', color:'#0d0f14', border:'none', borderRadius:6, padding:'8px 18px', fontWeight:700, fontSize:12, letterSpacing:'0.06em', cursor: loading ? 'not-allowed' : 'pointer', fontFamily:"'Space Mono',monospace", transition:'background 0.2s' }}
-              >
+              <button onClick={load} disabled={loading} style={{ display:'flex', alignItems:'center', gap:7, background: loading ? '#8a6a1a' : '#f0b429', color:'#0d0f14', border:'none', borderRadius:6, padding:'8px 18px', fontWeight:700, fontSize:12, letterSpacing:'0.06em', cursor: loading ? 'not-allowed' : 'pointer', fontFamily:"'Space Mono',monospace", transition:'background 0.2s' }}>
                 <span style={{ fontSize:10 }}>▶</span>
-                {loading ? 'SCANNING…' : 'SCAN MARKET'}
+                {loading ? 'LOADING…' : 'REFRESH'}
               </button>
             </div>
           </div>
         </div>
 
-        {/* Progress bar */}
-        <div style={{ height:2, background:'rgba(255,255,255,0.06)' }}>
-          <div style={{ height:'100%', width:`${progress}%`, background:'linear-gradient(90deg,#f0b429,#f0b42966)', transition:'width 0.5s ease' }} />
-        </div>
+        {/* Thin gold bar */}
+        <div style={{ height:2, background: loading ? 'linear-gradient(90deg,#f0b429,#f0b42966)' : 'rgba(255,255,255,0.04)' }} />
 
         {/* Tabs */}
         <div style={{ maxWidth:960, margin:'0 auto', padding:'0 24px', borderBottom:'1px solid rgba(255,255,255,0.06)', display:'flex' }}>
@@ -233,22 +151,44 @@ export default function Home() {
           ))}
         </div>
 
-        {/* Asset list */}
+        {/* Content */}
         <div style={{ maxWidth:960, margin:'0 auto', padding:'0 24px 60px' }}>
-          {assets.length === 0 && (
-            <div style={{ padding:'60px 0', textAlign:'center', color:'#334' }}>
-              <div style={{ fontSize:13, letterSpacing:'0.1em', fontFamily:"'Space Mono',monospace" }}>SCANNING MARKET…</div>
+
+          {/* Seeding state */}
+          {seeding && (
+            <div style={{ margin:'32px 0', padding:'20px 24px', background:'rgba(240,180,41,0.07)', border:'1px solid rgba(240,180,41,0.2)', borderRadius:10 }}>
+              <div style={{ fontSize:13, fontWeight:600, color:'#f0b429', fontFamily:"'Space Mono',monospace", marginBottom:8 }}>
+                ▶ FIRST-TIME SETUP
+              </div>
+              <div style={{ fontSize:13, color:'#889', lineHeight:1.7 }}>
+                The database is empty. Trigger the first data fetch by visiting:<br/>
+                <span style={{ fontFamily:"'Space Mono',monospace", color:'#f0b429', fontSize:12 }}>
+                  your-url.vercel.app/api/cron
+                </span>
+                <br/>This takes ~3 minutes. After that, data refreshes automatically every 5 minutes.
+              </div>
             </div>
           )}
+
+          {error && (
+            <div style={{ margin:'24px 0', padding:'14px 18px', background:'rgba(255,68,68,0.08)', border:'1px solid rgba(255,68,68,0.2)', borderRadius:8, color:'#ff6666', fontSize:13 }}>
+              Error: {error}
+            </div>
+          )}
+
+          {!seeding && assets.length === 0 && !error && (
+            <div style={{ padding:'60px 0', textAlign:'center', color:'#334' }}>
+              <div style={{ fontSize:13, letterSpacing:'0.1em', fontFamily:"'Space Mono',monospace" }}>LOADING…</div>
+            </div>
+          )}
+
           {assets.length > 0 && (
             <div style={{ marginTop:8 }}>
               <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 0 4px', borderBottom:'1px solid rgba(255,255,255,0.06)', marginBottom:4 }}>
                 <span style={{ fontSize:11, fontWeight:700, letterSpacing:'0.12em', color:'#f0b429', fontFamily:"'Space Mono',monospace" }}>CRYPTO</span>
                 <span style={{ fontSize:11, color:'#334' }}>{total} assets</span>
               </div>
-              {assets.map((asset, i) => (
-                <AssetRow key={asset.id} asset={asset} signals={signals[asset.id] ?? null} index={i} />
-              ))}
+              {assets.map(asset => <AssetRow key={asset.id} asset={asset} />)}
             </div>
           )}
         </div>
