@@ -1,4 +1,4 @@
-// pages/api/cron.js — v2 with Forex support
+// pages/api/cron.js — v3: robust error logging, forex debug
 import { fetchKlines, fetchAllPrices, CRYPTO_ASSETS, TIMEFRAMES } from '../../lib/binance'
 import { fetchForexOHLC, fetchForexPrice, FOREX_ASSETS } from '../../lib/forex'
 import { calcHeikinAshi, detectSignal, buildCandleBlocks } from '../../lib/heikinAshi'
@@ -18,15 +18,22 @@ async function upsert(rows) {
     },
     body: JSON.stringify(rows),
   })
-  if (!res.ok) throw new Error(`Supabase upsert failed: ${await res.text()}`)
+  if (!res.ok) {
+    const txt = await res.text()
+    throw new Error(`Supabase upsert failed: ${txt}`)
+  }
 }
 
 export default async function handler(req, res) {
+  const log = []  // collect a log so we can return it for debugging
+
   try {
     const rows = []
 
     // ── CRYPTO ──────────────────────────────────────────────
+    log.push('Fetching crypto prices...')
     const prices = await fetchAllPrices(CRYPTO_ASSETS.map(a => a.id))
+    log.push(`Got prices for ${Object.keys(prices).length} coins`)
 
     for (const asset of CRYPTO_ASSETS) {
       const priceData = prices[asset.id]
@@ -38,9 +45,8 @@ export default async function handler(req, res) {
           const ha = calcHeikinAshi(candles)
           const { signal, strength } = detectSignal(ha)
           const blocks = buildCandleBlocks(ha)
-          // Store raw candles too (for charting)
           timeframes.push({ timeframe: tf.label, signal, strength, blocks, candles: candles.slice(-60) })
-        } catch {
+        } catch (e) {
           timeframes.push({ timeframe: tf.label, signal: 'ERROR', strength: 0, blocks: [], candles: [] })
         }
       }
@@ -54,22 +60,36 @@ export default async function handler(req, res) {
         timeframes,
         updated_at: new Date().toISOString(),
       })
+      log.push(`✓ ${asset.ticker}`)
     }
 
     // ── FOREX ────────────────────────────────────────────────
+    log.push('Starting forex...')
+    const avKey = process.env.ALPHA_VANTAGE_KEY
+    log.push(`Alpha Vantage key: ${avKey ? `set (${avKey.substring(0,4)}...)` : 'MISSING'}`)
+
     for (const fx of FOREX_ASSETS) {
       try {
+        log.push(`Fetching ${fx.ticker}...`)
         await sleep(2000)
+
         const price = await fetchForexPrice(fx.from, fx.to)
-        const ohlc  = await fetchForexOHLC(fx.from, fx.to)
-        const ha    = calcHeikinAshi(ohlc)
+        log.push(`  price: ${price}`)
+
+        const ohlc = await fetchForexOHLC(fx.from, fx.to)
+        log.push(`  ohlc candles: ${ohlc.length}`)
+
+        const ha = calcHeikinAshi(ohlc)
         const { signal, strength } = detectSignal(ha)
         const blocks = buildCandleBlocks(ha)
 
-        // Weekly slice (last 7 daily candles as a proxy for weekly signal)
         const weeklyOhlc = ohlc.slice(-35)
         const haW = calcHeikinAshi(weeklyOhlc)
         const sigW = detectSignal(haW)
+
+        const pctChange = ohlc.length >= 2
+          ? ((ohlc[ohlc.length-1].close - ohlc[ohlc.length-2].close) / ohlc[ohlc.length-2].close) * 100
+          : null
 
         rows.push({
           coin_id: fx.id,
@@ -77,16 +97,16 @@ export default async function handler(req, res) {
           name: fx.name,
           asset_type: 'FOREX',
           price,
-          price_change_pct: ohlc.length >= 2
-            ? ((ohlc[ohlc.length-1].close - ohlc[ohlc.length-2].close) / ohlc[ohlc.length-2].close) * 100
-            : null,
+          price_change_pct: pctChange,
           timeframes: [
             { timeframe: '1D', signal, strength, blocks, candles: ohlc.slice(-60) },
             { timeframe: '1W', signal: sigW.signal, strength: sigW.strength, blocks: buildCandleBlocks(haW), candles: ohlc.slice(-60) },
           ],
           updated_at: new Date().toISOString(),
         })
+        log.push(`✓ ${fx.ticker} — ${signal}`)
       } catch (e) {
+        log.push(`✗ ${fx.ticker} ERROR: ${e.message}`)
         rows.push({
           coin_id: fx.id,
           ticker: fx.ticker,
@@ -100,10 +120,13 @@ export default async function handler(req, res) {
       }
     }
 
+    log.push(`Saving ${rows.length} rows to Supabase...`)
     await upsert(rows)
-    res.status(200).json({ ok: true, saved: rows.length, at: new Date().toISOString() })
+    log.push('Done!')
+
+    res.status(200).json({ ok: true, saved: rows.length, log })
   } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: err.message })
+    log.push(`FATAL: ${err.message}`)
+    res.status(500).json({ error: err.message, log })
   }
 }
