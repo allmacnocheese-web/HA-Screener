@@ -1,4 +1,4 @@
-// pages/index.js — v3 (progressive signal loading)
+// pages/index.js — v4 (batched signal loading, 2 coins per batch)
 import { useState, useEffect, useRef } from 'react'
 import Head from 'next/head'
 
@@ -9,6 +9,10 @@ const SIGNAL_CONFIG = {
   NEUTRAL:       { label: 'Neutral',               color: '#556',    bg: 'rgba(100,100,100,0.08)', border: 'rgba(100,100,100,0.2)' },
   ERROR:         { label: 'Error',                 color: '#444',    bg: 'rgba(80,80,80,0.08)', border: 'rgba(80,80,80,0.2)' },
 }
+
+const BATCH_SIZE = 2        // coins per batch
+const BATCH_DELAY = 15000   // 15s between batches (CoinGecko free = 5 calls/min)
+const CALL_DELAY  = 3000    // 3s between coins within a batch
 
 function formatPrice(p) {
   if (p == null) return '—'
@@ -32,11 +36,16 @@ function SignalBadge({ signal }) {
   )
 }
 
-function AssetRow({ asset, signals }) {
-  const tfs = signals?.timeframes ?? null
+function AssetRow({ asset, signals, index }) {
+  const tfs  = signals?.timeframes ?? null
   const best = tfs?.reduce((b, tf) => tf.strength > (b?.strength ?? -1) ? tf : b, null)
-  const pct = asset.priceChangePercent
+  const pct  = asset.priceChangePercent
   const pctColor = pct > 0 ? '#00e5a0' : pct < 0 ? '#ff4444' : '#666'
+
+  // Which batch this coin belongs to (for the waiting label)
+  const batchNum   = Math.floor(index / BATCH_SIZE) + 1
+  const totalBatch = Math.ceil(10 / BATCH_SIZE)
+  const waitSecs   = Math.floor(index / BATCH_SIZE) * (BATCH_DELAY / 1000)
 
   return (
     <div style={{ borderBottom:'1px solid rgba(255,255,255,0.06)', padding:'16px 0' }}>
@@ -46,9 +55,11 @@ function AssetRow({ asset, signals }) {
           <span style={{ fontSize:13, color:'#445' }}>— {asset.name}</span>
         </div>
         <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-          {best
-            ? <SignalBadge signal={best.signal} />
-            : <span style={{ fontSize:11, color:'#334', fontFamily:"'Space Mono',monospace" }}>scanning…</span>
+          {tfs
+            ? best ? <SignalBadge signal={best.signal} /> : <SignalBadge signal="NEUTRAL" />
+            : <span style={{ fontSize:11, color:'#334', fontFamily:"'Space Mono',monospace" }}>
+                {batchNum === 1 ? 'scanning…' : `batch ${batchNum}/${totalBatch} (~${waitSecs}s)`}
+              </span>
           }
           <div style={{ textAlign:'right' }}>
             <div style={{ fontSize:16, fontWeight:700, color:'#e8e8e0' }}>{formatPrice(asset.price)}</div>
@@ -74,7 +85,9 @@ function AssetRow({ asset, signals }) {
         : ['1D','1W'].map((tf) => (
           <div key={tf} style={{ display:'flex', alignItems:'center', gap:10, marginBottom:6, paddingLeft:4 }}>
             <span style={{ fontSize:10, color:'#334', width:28, fontWeight:600 }}>{tf}</span>
-            <span style={{ fontSize:11, color:'#334' }}>fetching…</span>
+            <span style={{ fontSize:11, color:'#334' }}>
+              {batchNum === 1 ? 'fetching…' : `waiting for batch ${batchNum}…`}
+            </span>
           </div>
         ))
       }
@@ -82,58 +95,94 @@ function AssetRow({ asset, signals }) {
   )
 }
 
+function Countdown({ target }) {
+  const [secs, setSecs] = useState(0)
+  useEffect(() => {
+    const tick = () => {
+      const left = Math.max(0, Math.round((target - Date.now()) / 1000))
+      setSecs(left)
+    }
+    tick()
+    const id = setInterval(tick, 1000)
+    return () => clearInterval(id)
+  }, [target])
+  if (secs <= 0) return null
+  return (
+    <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:'#f0b42988' }}>
+      next batch in {secs}s
+    </span>
+  )
+}
+
 export default function Home() {
-  const [assets, setAssets]   = useState([])
-  const [signals, setSignals] = useState({})
-  const [loading, setLoading] = useState(false)
+  const [assets,   setAssets]   = useState([])
+  const [signals,  setSignals]  = useState({})
+  const [loading,  setLoading]  = useState(false)
   const [progress, setProgress] = useState(0)
+  const [loaded,   setLoaded]   = useState(0)
   const [lastScan, setLastScan] = useState(null)
-  const [loaded, setLoaded]   = useState(0)
-  const scanRef = useRef(false)
+  const [nextBatch, setNextBatch] = useState(null)
+  const scanning = useRef(false)
 
   async function scan() {
-    if (scanRef.current) return
-    scanRef.current = true
+    if (scanning.current) return
+    scanning.current = true
     setLoading(true)
     setSignals({})
     setLoaded(0)
     setProgress(5)
+    setNextBatch(null)
 
     try {
-      // 1. Fetch all prices in one fast call
+      // Step 1: Load all prices instantly (1 API call)
       const r = await fetch('/api/scan')
       const data = await r.json()
-      setAssets(data.assets || [])
-      setLastScan(new Date())
-      setProgress(15)
-
-      // 2. Fetch signals for each coin, one at a time with 1.5s gap
       const list = data.assets || []
-      for (let i = 0; i < list.length; i++) {
-        const coin = list[i]
-        try {
-          const sr = await fetch(`/api/signals?id=${coin.id}`)
-          const sd = await sr.json()
-          setSignals(prev => ({ ...prev, [coin.id]: sd }))
-          setLoaded(i + 1)
-          setProgress(15 + Math.round(((i + 1) / list.length) * 85))
-        } catch (e) {
-          console.error('signal error', coin.id, e)
+      setAssets(list)
+      setLastScan(new Date())
+      setProgress(10)
+
+      // Step 2: Split into batches and load with delays
+      const total = list.length
+      for (let b = 0; b < total; b += BATCH_SIZE) {
+        const batch = list.slice(b, b + BATCH_SIZE)
+
+        // Show countdown for the next batch (skip for first batch)
+        if (b > 0) {
+          const batchReady = Date.now() + BATCH_DELAY
+          setNextBatch(batchReady)
+          await new Promise(r => setTimeout(r, BATCH_DELAY))
+          setNextBatch(null)
         }
-        // Wait 1.5s between coins to stay under CoinGecko rate limit
-        if (i < list.length - 1) await new Promise(r => setTimeout(r, 1500))
+
+        // Fetch each coin in the batch with a small gap between them
+        for (let i = 0; i < batch.length; i++) {
+          if (i > 0) await new Promise(r => setTimeout(r, CALL_DELAY))
+          const coin = batch[i]
+          try {
+            const sr = await fetch(`/api/signals?id=${coin.id}`)
+            const sd = await sr.json()
+            setSignals(prev => ({ ...prev, [coin.id]: sd }))
+            setLoaded(prev => prev + 1)
+            setProgress(10 + Math.round(((b + i + 1) / total) * 90))
+          } catch (e) {
+            console.error('signal error', coin.id, e)
+          }
+        }
       }
     } catch(e) {
       console.error(e)
     } finally {
       setLoading(false)
-      scanRef.current = false
+      scanning.current = false
+      setProgress(100)
+      setTimeout(() => setProgress(0), 1000)
     }
   }
 
   useEffect(() => { scan() }, [])
 
-  const now = lastScan?.toLocaleTimeString('en-SG', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }) ?? '—'
+  const now   = lastScan?.toLocaleTimeString('en-SG', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false }) ?? '—'
   const total = assets.length || 10
 
   return (
@@ -154,19 +203,17 @@ export default function Home() {
               <div style={{ fontFamily:"'Space Mono',monospace", fontSize:9, color:'#446', letterSpacing:'0.25em', marginTop:1 }}>HEIKIN-ASHI SIGNAL SCANNER</div>
             </div>
             <div style={{ display:'flex', alignItems:'center', gap:16 }}>
-              {lastScan && (
+              {nextBatch && <Countdown target={nextBatch} />}
+              {lastScan && !nextBatch && (
                 <span style={{ fontFamily:"'Space Mono',monospace", fontSize:11, color:'#445' }}>
                   {loaded}/{total} Last: {now}
                 </span>
               )}
-              <button onClick={() => { scanRef.current = false; scan() }} disabled={loading} style={{
-                display:'flex', alignItems:'center', gap:7,
-                background: loading ? '#8a6a1a' : '#f0b429', color:'#0d0f14',
-                border:'none', borderRadius:6, padding:'8px 18px',
-                fontWeight:700, fontSize:12, letterSpacing:'0.06em',
-                cursor: loading ? 'not-allowed' : 'pointer',
-                fontFamily:"'Space Mono',monospace", transition:'background 0.2s',
-              }}>
+              <button
+                onClick={() => { scanning.current = false; scan() }}
+                disabled={loading}
+                style={{ display:'flex', alignItems:'center', gap:7, background: loading ? '#8a6a1a' : '#f0b429', color:'#0d0f14', border:'none', borderRadius:6, padding:'8px 18px', fontWeight:700, fontSize:12, letterSpacing:'0.06em', cursor: loading ? 'not-allowed' : 'pointer', fontFamily:"'Space Mono',monospace", transition:'background 0.2s' }}
+              >
                 <span style={{ fontSize:10 }}>▶</span>
                 {loading ? 'SCANNING…' : 'SCAN MARKET'}
               </button>
@@ -199,8 +246,8 @@ export default function Home() {
                 <span style={{ fontSize:11, fontWeight:700, letterSpacing:'0.12em', color:'#f0b429', fontFamily:"'Space Mono',monospace" }}>CRYPTO</span>
                 <span style={{ fontSize:11, color:'#334' }}>{total} assets</span>
               </div>
-              {assets.map(asset => (
-                <AssetRow key={asset.id} asset={asset} signals={signals[asset.id] ?? null} />
+              {assets.map((asset, i) => (
+                <AssetRow key={asset.id} asset={asset} signals={signals[asset.id] ?? null} index={i} />
               ))}
             </div>
           )}
