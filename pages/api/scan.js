@@ -1,61 +1,58 @@
 // pages/api/scan.js
-// Server-side API route: fetches CoinGecko data, runs HA signal engine, returns results
-
 import { fetchKlines, fetchAllPrices, CRYPTO_ASSETS, TIMEFRAMES } from '../../lib/binance'
 import { calcHeikinAshi, detectSignal, buildCandleBlocks } from '../../lib/heikinAshi'
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Only fetch 2 timeframes per coin to stay within Vercel's 10s free-tier limit
+// 1H uses days=1, 1D uses days=30
+const ACTIVE_TIMEFRAMES = [
+  { label: '1H', days: 1  },
+  { label: '4H', days: 7  },
+  { label: '1D', days: 30 },
+]
+
+export const config = { maxDuration: 60 } // Vercel Pro allows up to 60s; free tier ignores but doesn't break
+
 export default async function handler(req, res) {
-  res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30')
+  res.setHeader('Cache-Control', 's-maxage=120, stale-while-revalidate=60')
 
   try {
-    // Fetch all prices in one API call
+    // One call gets all prices
     const ids = CRYPTO_ASSETS.map((a) => a.id)
     const prices = await fetchAllPrices(ids)
 
-    // Fetch OHLC + run signals for each asset
-    const results = await Promise.all(
-      CRYPTO_ASSETS.map(async (asset) => {
+    const results = []
+
+    for (const asset of CRYPTO_ASSETS) {
+      const priceData = prices[asset.id]
+      const price = priceData?.usd ?? null
+      const priceChangePercent = priceData?.usd_24h_change ?? null
+
+      const timeframeData = []
+
+      for (const tf of ACTIVE_TIMEFRAMES) {
         try {
-          const priceData = prices[asset.id]
-          const price = priceData?.usd ?? null
-          const priceChangePercent = priceData?.usd_24h_change ?? null
-
-          // Fetch signals for all timeframes in parallel
-          const timeframeData = await Promise.all(
-            TIMEFRAMES.map(async (tf) => {
-              try {
-                const candles = await fetchKlines(asset.id, tf.days)
-                const ha = calcHeikinAshi(candles)
-                const { signal, strength } = detectSignal(ha)
-                const blocks = buildCandleBlocks(ha)
-                return { timeframe: tf.label, signal, strength, blocks }
-              } catch {
-                return { timeframe: tf.label, signal: 'ERROR', strength: 0, blocks: [] }
-              }
-            })
-          )
-
-          return {
-            ...asset,
-            price,
-            prevClose: null,
-            priceChangePercent,
-            timeframes: timeframeData,
-          }
+          await sleep(500) // stay under CoinGecko rate limit (30 calls/min free tier)
+          const candles = await fetchKlines(asset.id, tf.days)
+          const ha = calcHeikinAshi(candles)
+          const { signal, strength } = detectSignal(ha)
+          const blocks = buildCandleBlocks(ha)
+          timeframeData.push({ timeframe: tf.label, signal, strength, blocks })
         } catch (err) {
-          return {
-            ...asset,
-            price: null,
-            prevClose: null,
-            priceChangePercent: null,
-            timeframes: TIMEFRAMES.map((tf) => ({
-              timeframe: tf.label, signal: 'ERROR', strength: 0, blocks: [],
-            })),
-            error: err.message,
-          }
+          const label = err.message === 'RATE_LIMITED' ? 'Rate limited' : 'Error'
+          timeframeData.push({ timeframe: tf.label, signal: 'ERROR', strength: 0, blocks: [], errorMsg: label })
         }
+      }
+
+      results.push({
+        ...asset,
+        price,
+        prevClose: null,
+        priceChangePercent,
+        timeframes: timeframeData,
       })
-    )
+    }
 
     res.status(200).json({
       assets: results,
