@@ -1,7 +1,7 @@
-// /api/cron — fetches crypto + forex + US stocks, saves to Supabase
+// /api/cron — CoinGecko for crypto, Yahoo Finance for forex + stocks
 import { CRYPTO, CRYPTO_TF, FOREX, STOCKS,
          fetchCryptoPrices, fetchCryptoOHLC,
-         fetchForexPrice, fetchForexOHLC,
+         fetchForexOHLC, fetchForexPrice,
          fetchStockOHLC, fetchStockPrice } from '../../lib/sources'
 import { calcHeikinAshi, detectSignal, getBlocks } from '../../lib/heikinAshi'
 
@@ -23,12 +23,24 @@ async function upsert(rows) {
   if (!r.ok) throw new Error(`Supabase upsert: ${await r.text()}`)
 }
 
+function buildTfs(ohlc) {
+  // 1D = full 3mo daily candles, 1W = last 35 candles as weekly proxy
+  const ha1d  = calcHeikinAshi(ohlc)
+  const sig1d = detectSignal(ha1d)
+  const ha1w  = calcHeikinAshi(ohlc.slice(-35))
+  const sig1w = detectSignal(ha1w)
+  return [
+    { timeframe: '1D', ...sig1d, blocks: getBlocks(ha1d), candles: ohlc.slice(-60) },
+    { timeframe: '1W', ...sig1w, blocks: getBlocks(ha1w), candles: ohlc.slice(-60) },
+  ]
+}
+
 export default async function handler(req, res) {
   const log  = []
   const rows = []
 
   try {
-    // ── CRYPTO ────────────────────────────────────────────────────────────
+    // ── CRYPTO (CoinGecko, 12s gap) ───────────────────────────────────────
     log.push('=== CRYPTO ===')
     const prices = await fetchCryptoPrices(CRYPTO.map(a => a.id))
     log.push(`prices: ${Object.keys(prices).length} coins`)
@@ -57,64 +69,46 @@ export default async function handler(req, res) {
       })
     }
 
-    // ── FOREX ─────────────────────────────────────────────────────────────
-    log.push('=== FOREX ===')
-    const avKey = process.env.ALPHA_VANTAGE_KEY
-    log.push(`ALPHA_VANTAGE_KEY: ${avKey ? `SET (${avKey.slice(0,4)}...)` : 'NOT SET ❌'}`)
-
+    // ── FOREX (Yahoo Finance, no rate limit) ──────────────────────────────
+    log.push('=== FOREX (Yahoo Finance) ===')
     for (const fx of FOREX) {
       try {
-        await sleep(15000)
-        const price = await fetchForexPrice(fx.from, fx.to)
-        const ohlc  = await fetchForexOHLC(fx.from, fx.to)
-        const ha1d  = calcHeikinAshi(ohlc)
-        const sig1d = detectSignal(ha1d)
-        const ha1w  = calcHeikinAshi(ohlc.slice(-35))
-        const sig1w = detectSignal(ha1w)
-        const pct   = ohlc.length >= 2
-          ? ((ohlc.at(-1).close - ohlc.at(-2).close) / ohlc.at(-2).close) * 100
-          : null
+        await sleep(500) // tiny gap just to be polite
+        const [ohlc, { price, pct }] = await Promise.all([
+          fetchForexOHLC(fx.symbol),
+          fetchForexPrice(fx.symbol),
+        ])
+        log.push(`  ${fx.ticker}: price=${price.toFixed(4)}, candles=${ohlc.length}`)
         rows.push({
           coin_id: fx.id, ticker: fx.ticker, name: fx.name,
           asset_type: 'FOREX', price, price_change_pct: pct,
-          timeframes: [
-            { timeframe: '1D', ...sig1d, blocks: getBlocks(ha1d), candles: ohlc.slice(-60) },
-            { timeframe: '1W', ...sig1w, blocks: getBlocks(ha1w), candles: ohlc.slice(-60) },
-          ],
+          timeframes: buildTfs(ohlc),
           updated_at: new Date().toISOString(),
         })
-        log.push(`  ${fx.ticker}: ${sig1d.signal}`)
+        log.push(`  ${fx.ticker}: ${detectSignal(calcHeikinAshi(ohlc)).signal}`)
       } catch(e) {
         log.push(`  ${fx.ticker}: ERROR — ${e.message}`)
         rows.push({ coin_id: fx.id, ticker: fx.ticker, name: fx.name, asset_type: 'FOREX', price: null, price_change_pct: null, timeframes: [], updated_at: new Date().toISOString() })
       }
     }
 
-    // ── US STOCKS ─────────────────────────────────────────────────────────
-    log.push('=== US STOCKS ===')
-
+    // ── US STOCKS (Yahoo Finance, no rate limit) ───────────────────────────
+    log.push('=== US STOCKS (Yahoo Finance) ===')
     for (const stock of STOCKS) {
       try {
-        await sleep(15000) // AV free: 5 calls/min — 15s gap keeps us safe
-        const { price, change } = await fetchStockPrice(stock.ticker)
-        const ohlc = await fetchStockOHLC(stock.ticker)
-        await sleep(15000)
-
-        const ha1d  = calcHeikinAshi(ohlc)
-        const sig1d = detectSignal(ha1d)
-        const ha1w  = calcHeikinAshi(ohlc.slice(-35))
-        const sig1w = detectSignal(ha1w)
-
+        await sleep(500)
+        const [ohlc, { price, pct }] = await Promise.all([
+          fetchStockOHLC(stock.ticker),
+          fetchStockPrice(stock.ticker),
+        ])
+        log.push(`  ${stock.ticker}: $${price.toFixed(2)}, candles=${ohlc.length}`)
         rows.push({
           coin_id: stock.id, ticker: stock.ticker, name: stock.name,
-          asset_type: 'US_STOCKS', price, price_change_pct: change,
-          timeframes: [
-            { timeframe: '1D', ...sig1d, blocks: getBlocks(ha1d), candles: ohlc.slice(-60) },
-            { timeframe: '1W', ...sig1w, blocks: getBlocks(ha1w), candles: ohlc.slice(-60) },
-          ],
+          asset_type: 'US_STOCKS', price, price_change_pct: pct,
+          timeframes: buildTfs(ohlc),
           updated_at: new Date().toISOString(),
         })
-        log.push(`  ${stock.ticker}: ${sig1d.signal} @ $${price}`)
+        log.push(`  ${stock.ticker}: ${detectSignal(calcHeikinAshi(ohlc)).signal}`)
       } catch(e) {
         log.push(`  ${stock.ticker}: ERROR — ${e.message}`)
         rows.push({ coin_id: stock.id, ticker: stock.ticker, name: stock.name, asset_type: 'US_STOCKS', price: null, price_change_pct: null, timeframes: [], updated_at: new Date().toISOString() })
@@ -123,9 +117,13 @@ export default async function handler(req, res) {
 
     log.push(`=== SAVING ${rows.length} rows ===`)
     await upsert(rows)
-    log.push('DONE ✓')
+    log.push('ALL DONE ✓')
 
-    res.status(200).json({ ok: true, total: rows.length, breakdown: { crypto: CRYPTO.length, forex: FOREX.length, stocks: STOCKS.length }, log })
+    res.status(200).json({
+      ok: true, total: rows.length,
+      breakdown: { crypto: CRYPTO.length, forex: FOREX.length, stocks: STOCKS.length },
+      log,
+    })
   } catch(err) {
     log.push(`FATAL: ${err.message}`)
     res.status(500).json({ error: err.message, log })
